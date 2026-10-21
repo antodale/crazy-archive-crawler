@@ -1,0 +1,6 @@
+# generated pages and downloaded images
+fanzi_out/
+
+# Python caches
+__pycache__/
+.pytest_cache/
