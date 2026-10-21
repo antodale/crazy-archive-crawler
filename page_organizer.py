@@ -1,11 +1,15 @@
-"""Pack images, titles and texts on a page and get it back as HTML.
+"""Pack images, titles and texts on as many pages as needed and get them back as HTML.
 
 Usage from another file:
 
     from page_organizer import build_page
 
     html = build_page(["a.jpg", "b.png"], ["A title"], ["some text", "more text"],
-                      page_width=600, page_height=850, seed=1, out_path="out/page.html")
+                      page_width=2480, page_height=3508, seed=1,
+                      out_path="out/zine.html", png_path="out/zine.png")
+    # -> out/zine.html with every page, out/zine_p1.png, out/zine_p2.png, ...
+
+All sizes are in pixels. Everything given is placed: new pages are added until it all fits.
 """
 
 from __future__ import annotations  # lets packer() name Grid before the class is defined
@@ -19,9 +23,27 @@ from urllib.parse import quote
 
 from PIL import Image, ImageDraw
 from PIL import ImageFont
-from rectpack import newPacker, GuillotineBssfSas, SORT_NONE
+from rectpack import newPacker, GuillotineBssfSas, SORT_NONE, PackingBin, PackingMode
 
 FONT_DIR = Path(__file__).parent / "fonts"  # works whatever folder you run the script from
+A4 = (2480, 3508)        # A4 at 300 dpi, in pixels: the default page
+REFERENCE_WIDTH = 794    # A4 at 96 dpi: font sizes are designed for this width and scaled for others
+
+
+# packs boxes on as many pages as needed, in the order given: each box goes on the open page
+# where it fits best, and a new page is opened when it fits nowhere. Sets .x, .y and .page
+# (0, 1, 2...) on every box and returns the number of pages. A box bigger than an empty
+# page can't be placed and keeps .page = None (build_page shrinks boxes so that can't happen).
+def pack_pages(boxes: list, page_width: int, page_height: int, gutter=0) -> int:
+    packer = newPacker(mode=PackingMode.Online, bin_algo=PackingBin.BBF,
+                       pack_algo=GuillotineBssfSas, rotation=False)
+    packer.add_bin(page_width, page_height, count=float("inf"))
+    for i, box in enumerate(boxes):
+        box.x = box.y = box.page = None
+        packer.add_rect(box.width + gutter, box.height + gutter, rid=i)
+    for page, x, y, width, height, i in packer.rect_list():
+        boxes[i].x, boxes[i].y, boxes[i].page = x, y, page
+    return len(packer)
 
 
 # packer function, takes boxes (anything with .width and .height, like PageImage and Title)
@@ -68,11 +90,13 @@ class Grid:
 # Title class, same shit as you can imagine, but with split function
 # font_path / font_size: pass them to force a font or size, leave None for random ones
 # rng: pass one shared random.Random(seed) to make the layout reproducible
+# scale: multiplies the random size, so titles keep their look on bigger pages
 class Title:
-    def __init__(self, text, max_width, font_path=None, font_size=None, rng=random):
+    def __init__(self, text, max_width, font_path=None, font_size=None, rng=random, scale=1):
         self.text = text
         self.rng = rng
-        self.font_size = font_size or self._balan_dim()  # size first, then the font at that size
+        # size first, then the font at that size; at least 1px, Pillow can't make a 0px font
+        self.font_size = font_size or max(1, round(self._balan_dim() * scale))
         self.font = ImageFont.truetype(font_path or self._random_font(), self.font_size)
         self.lines = self._split(max_width)
         # whole pixels, rounded up: the Grid can't occupy 30.7 cells
@@ -80,6 +104,7 @@ class Title:
         self.height = math.ceil(self.font_size * 1.2 * len(self.lines))
         self.x = None   # filled in after packing
         self.y = None
+        self.page = None  # which page it landed on, filled in by pack_pages
         self.link = None  # where clicking it goes, set by build_page
 
     def _split(self, max_width):
@@ -127,6 +152,7 @@ class PageImage:
         self.resize(target_width)
         self.x = None   # filled in after packing
         self.y = None
+        self.page = None  # which page it landed on, filled in by pack_pages
         self.link = None  # where clicking it goes, set by build_page
 
     def resize(self, new_width):
@@ -151,33 +177,55 @@ def _split_link(item):
     return item if isinstance(item, tuple) else (item, None)
 
 
-# draws the packed boxes into a PNG with Pillow: same positions, fonts and line breaks as the HTML
-def _render_png(boxes: list, page_width: int, page_height: int, path) -> None:
-    page = Image.new("RGB", (page_width, page_height), "white")
-    draw = ImageDraw.Draw(page)
+# draws the packed boxes into a PNG with Pillow: same positions, fonts and line breaks as the HTML.
+# page: draw only the boxes on that page (None = every placed box)
+def _render_png(boxes: list, page_width: int, page_height: int, path, page=None) -> None:
+    image = Image.new("RGB", (page_width, page_height), "white")
+    draw = ImageDraw.Draw(image)
     for box in boxes:
-        if box.x is None:
-            continue  # didn't fit
+        if box.x is None or (page is not None and box.page != page):
+            continue  # didn't fit, or is on another page
         if isinstance(box, PageImage):
             with Image.open(box.path) as picture:
                 picture = picture.convert("RGBA").resize((box.width, box.height))
-                page.paste(picture, (box.x, box.y), picture)  # 3rd arg: keep transparency
+                image.paste(picture, (box.x, box.y), picture)  # 3rd arg: keep transparency
         else:
             line_height = box.font_size * 1.2
-            for line_number, line in enumerate(box.lines):
+            visible = max(1, int(box.height // line_height))  # lines that fit the box (it may have been cut)
+            for line_number, line in enumerate(box.lines[:visible]):
                 draw.text((box.x, box.y + line_number * line_height), line, font=box.font, fill="black")
-    page.save(path)
+    image.save(path)
+
+
+# "out/zine.png", page 2 -> "out/zine_p2.png"
+def page_png_path(png_path, page_number: int) -> str:
+    base, extension = os.path.splitext(str(png_path))
+    return f"{base}_p{page_number}{extension}"
+
+
+# shrinks a box until it fits on an empty page (page minus gutter), or pack_pages could never place it.
+# Images keep their proportions; text boxes are cut (the HTML hides the overflow, the PNG skips lines).
+def _fit_on_page(box, room_width: int, room_height: int) -> None:
+    if isinstance(box, PageImage):
+        while box.width > room_width or box.height > room_height:
+            box.resize(min(room_width, box.width * room_height / box.height, box.width - 1))
+    else:
+        box.width, box.height = min(box.width, room_width), min(box.height, room_height)
 
 
 # main function: images are file paths, titles and texts are strings, sizes in pixels.
 # Any item can also be a (content, link) pair: that element becomes clickable and opens link.
-# Same seed -> same page. Boxes that don't fit on the page are left out.
-# Returns the HTML; if out_path is given it's also saved there, if png_path is given
-# the same page is also drawn as an image there.
-def build_page(images: list, titles: list, texts: list, page_width: int = 600, page_height: int = 850,
-               gutter: int = 4, seed=None, out_path=None, png_path=None) -> str:
+# Everything is placed: pages are added until it all fits. Same seed -> same pages.
+# gutter: space between boxes, None = scaled to the page (about 12px on A4 at 300 dpi).
+# Returns the HTML with every page; if out_path is given it's also saved there, if png_path
+# is given each page is also drawn as an image: zine.png -> zine_p1.png, zine_p2.png, ...
+def build_page(images: list, titles: list, texts: list, page_width: int = A4[0], page_height: int = A4[1],
+               gutter: int | None = None, seed=None, out_path=None, png_path=None) -> str:
     rng = random.Random(seed)
     out_dir = Path(out_path).resolve().parent if out_path else None
+    scale = page_width / REFERENCE_WIDTH  # fonts grow with the page, so any resolution looks the same
+    if gutter is None:
+        gutter = max(1, round(4 * scale))
     max_width = page_width - gutter  # nothing wider than the page
 
     page_images, page_titles, page_texts = [], [], []
@@ -187,22 +235,26 @@ def build_page(images: list, titles: list, texts: list, page_width: int = 600, p
         page_images[-1].link = link
     for item in titles:
         text, link = _split_link(item)
-        page_titles.append(Title(text, max_width, rng=rng))
+        page_titles.append(Title(text, max_width, rng=rng, scale=scale))
         page_titles[-1].link = link
     for item in texts:  # texts are boxes like titles, just smaller and narrower
         text, link = _split_link(item)
         page_texts.append(Title(text, rng.randint(page_width // 4, page_width // 2),
-                                font_size=rng.randint(10, 16), rng=rng))
+                                font_size=round(rng.randint(10, 16) * scale), rng=rng))
         page_texts[-1].link = link
 
-    boxes = page_images + page_titles + page_texts  # packing order: images, titles, texts
-    packer(Grid(page_width, page_height), boxes, page_width, page_height, gutter)
+    # mix the three kinds evenly through the packing order, so every page gets images, titles
+    # and text: each box gets a position between 0 and 1 within its own kind, then all are sorted
+    groups = [page_images, page_titles, page_texts]
+    keyed = [((i + rng.random()) / len(group), box) for group in groups for i, box in enumerate(group)]
+    boxes = [box for _, box in sorted(keyed, key=lambda pair: pair[0])]
+    for box in boxes:
+        _fit_on_page(box, page_width - gutter, page_height - gutter)
+    n_pages = pack_pages(boxes, page_width, page_height, gutter)
 
     fonts = {}  # font file -> css family name
-    parts = []
-    for e in boxes:
-        if e.x is None:
-            continue  # didn't fit
+
+    def element_html(e) -> str:
         box = f"position:absolute; left:{e.x}px; top:{e.y}px; width:{e.width}px; height:{e.height}px;"
         if isinstance(e, PageImage):
             content = f'<img src="{escape(_src(e.path, out_dir))}" style="width:100%; height:100%; object-fit:cover; display:block;">'
@@ -214,30 +266,39 @@ def build_page(images: list, titles: list, texts: list, page_width: int = 600, p
             style = (f"{box} font-family:{family}; font-size:{e.font_size}px; "
                      f"line-height:1.2; white-space:pre; overflow:hidden;")
         if e.link:  # clickable box: a link that looks like the plain element, opens in a new tab
-            parts.append(f'<a href="{escape(e.link)}" target="_blank" rel="noopener" '
-                         f'style="{style} display:block; color:inherit; text-decoration:none;">{content}</a>')
-        else:
-            parts.append(f'<div style="{style}">{content}</div>')
+            return (f'<a href="{escape(e.link)}" target="_blank" rel="noopener" '
+                    f'style="{style} display:block; color:inherit; text-decoration:none;">{content}</a>')
+        return f'<div style="{style}">{content}</div>'
+
+    pages_html = []
+    for p in range(n_pages):
+        parts = [element_html(e) for e in boxes if e.page == p]
+        pages_html.append('<div class="page">\n' + "\n".join(parts) + "\n</div>")
 
     font_css = "\n".join(f'@font-face {{ font-family: {family}; src: url("{escape(_src(path, out_dir))}"); }}'
                          for path, family in fonts.items())
+    # on screen the pages sit one under the other; printed, each page is its own sheet
     page = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>fanzi</title>
 <style>
 {font_css}
+@page {{ size: {page_width}px {page_height}px; margin: 0; }}
 body {{ margin: 0; background: #ddd; }}
-.page {{ position: relative; width: {page_width}px; height: {page_height}px; margin: 0 auto; background: white; }}
+.page {{ position: relative; width: {page_width}px; height: {page_height}px; margin: 20px auto;
+         background: white; overflow: hidden; }}
+@media print {{ body {{ background: none; }} .page {{ margin: 0; break-after: page; }} }}
 </style></head>
-<body><div class="page">
-{chr(10).join(parts)}
-</div></body></html>
+<body>
+{chr(10).join(pages_html)}
+</body></html>
 """
     if out_path:
         os.makedirs(out_dir, exist_ok=True)
         Path(out_path).write_text(page, encoding="utf-8")
     if png_path:
         os.makedirs(Path(png_path).resolve().parent, exist_ok=True)
-        _render_png(boxes, page_width, page_height, png_path)
+        for p in range(n_pages):
+            _render_png(boxes, page_width, page_height, page_png_path(png_path, p + 1), page=p)
     return page
 
 # demo: runs only with `python page_organizer.py`, not when another file imports this one
