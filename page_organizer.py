@@ -26,7 +26,7 @@ from PIL import ImageFont
 from rectpack import newPacker, GuillotineBssfSas, SORT_NONE, PackingBin, PackingMode
 
 FONT_DIR = Path(__file__).parent / "fonts"  # works whatever folder you run the script from
-A4 = (2480, 3508)        # A4 at 300 dpi, in pixels: the default page
+A4 = (1748, 2480)        # A4 at 300 dpi, in pixels: the default page
 REFERENCE_WIDTH = 794    # A4 at 96 dpi: font sizes are designed for this width and scaled for others
 
 
